@@ -16,7 +16,6 @@ from langgraph.graph import StateGraph, END
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "gemma3:4b"
 
-
 SECURITY_PROMPT = """You are a strict security-focused code reviewer.
 Find vulnerabilities (injection, auth, secrets, unsafe deserialization, SSRF, etc.).
 Return:
@@ -62,6 +61,7 @@ Produce:
 3) Hotspot files (files with most severe issues)
 4) Recommended next steps (action plan)
 """
+
 
 #############################
 # LANGGRAPH STATES AND NODES
@@ -258,7 +258,7 @@ def node_aggregate_repo_report(state: ReviewState) -> ReviewState:
     # Prepare a compact input to the final aggregator (use lead summaries, not all raw text).
     per_file_leads: List[str] = []
     for filepath, d in state["per_file_results"].items():
-        per_file_leads.append(f"FILE: {filepath}\n{d.get('lead','').strip()}")
+        per_file_leads.append(f"FILE: {filepath}\n{d.get('lead', '').strip()}")
 
     combined = "\n\n====================\n\n".join(per_file_leads)
 
@@ -335,7 +335,6 @@ def main():
     out_path = Path(args.out)
     out_path.write_text(final_state["final_report_md"], encoding="utf-8")
     print(f"\nWrote report: {out_path.resolve()}")
-
 
 
 if __name__ == "__main__":
