@@ -1,4 +1,5 @@
 import argparse
+import base64
 import os
 import textwrap
 from typing import Dict, List, Optional, TypedDict
@@ -9,6 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from langgraph.graph import StateGraph, END
+
 
 ##################
 # SETUP VARIABLES
@@ -77,9 +79,13 @@ class ReviewState(TypedDict):
 ################
 # COLLECT FILES
 ################
+# CODE_EXTENSIONS = {
+#     ".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".cs", ".cpp", ".c",
+#     ".rs", ".kt", ".swift", ".sql", ".html", ".css", ".md"
+# }
+# Temporarily removed other extensions due to GitHub API limit
 CODE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".cs", ".cpp", ".c",
-    ".rs", ".kt", ".swift", ".sql", ".html", ".css", ".md"
+    ".html"
 }
 
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build", ".idea", ".pytest_cache"}
@@ -87,36 +93,112 @@ SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "bu
 
 def collect_files(repo_path: str) -> List[str]:
     repo = Path(repo_path)
-    if not repo.exists():
-        raise FileNotFoundError(f"Repo path not found: {repo_path}")
-    if not repo.is_dir():
-        raise ValueError(f"Repo path is not a directory: {repo_path}")
 
-    found: List[str] = []
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for name in files:
-            p = Path(root) / name
-            if p.suffix.lower() in CODE_EXTENSIONS:
-                if p.stat().st_size > 300_000:
-                    continue
-                found.append(str(p))
-    found.sort()
-    return found
+    ###################
+    # LOCAL FILESYSTEM
+    ###################
+    if repo.exists():
+        if not repo.is_dir():
+            raise ValueError(f"Repo path is not a directory: {repo_path}")
+
+        found: List[str] = []
+        for root, dirs, files in os.walk(repo):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for name in files:
+                p = Path(root) / name
+                if p.suffix.lower() in CODE_EXTENSIONS:
+                    if p.stat().st_size > 300_000:
+                        continue
+                    found.append(str(p))
+        found.sort()
+        return found
+
+    #######################
+    # GITHUB WITH REST API
+    #######################
+    if "/" not in repo_path:
+        raise FileNotFoundError(f"Repo path not found: {repo_path}")
+
+    owner, repo_name = repo_path.split("/", 1)
+
+    token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    r = requests.get(f"https://api.github.com/repos/{owner}/{repo_name}", headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to fetch repo metadata: {r.status_code} {r.text}")
+    default_branch = r.json().get("default_branch", "master")
+
+    r = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/branches/{default_branch}",
+        headers=headers,
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to fetch branch '{default_branch}': {r.status_code} {r.text}")
+    sha = r.json()["commit"]["sha"]
+
+    r = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/git/trees/{sha}",
+        params={"recursive": "1"},
+        headers=headers,
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to fetch tree: {r.status_code} {r.text}")
+
+    tree = r.json().get("tree", [])
+    found_paths = []
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+        path = item.get("path", "")
+        if not path:
+            continue
+        if any(part in SKIP_DIRS for part in path.split("/")):
+            continue
+        if Path(path).suffix.lower() in CODE_EXTENSIONS:
+            found_paths.append(path)
+
+    found_paths.sort()
+    return [f"ghrest://{owner}/{repo_name}@{default_branch}/{p}" for p in found_paths]
 
 
 ###########################
 # READ FILES FROM THE REPO
 ###########################
 def read_text(path: str) -> str:
+    if path.startswith("ghrest://"):
+        rest = path[len("ghrest://"):]
+        # owner/repo@branch/path/to/file
+        owner, rest = rest.split("/", 1)
+        repo_and_branch, file_path = rest.split("/", 1)
+        repo_name, branch = repo_and_branch.split("@", 1)
+
+        token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+        headers = {}
+        if token:
+            headers["Authorization"] = f"token {token}"
+
+        r = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_path}",
+            params={"ref": branch},
+            headers=headers,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to read {file_path}: {r.status_code} {r.text}")
+
+        data = r.json()
+        if data.get("encoding") == "base64" and isinstance(data.get("content"), str):
+            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+
+        raise RuntimeError(f"Unexpected contents response for {file_path}")
+
+
     return Path(path).read_text(encoding="utf-8", errors="replace")
-
-
-def read_file(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    return p.read_text(encoding="utf-8", errors="replace")
 
 
 ####################################################################################################
@@ -169,7 +251,7 @@ def build_prompt(system_prompt: str, filepath: str, chunk: Chunk) -> str:
 def merge_chunk_reviews(agent_name: str, filepath: str, chunk_reviews: List[str]) -> str:
     """
     Merge chunk-level reviews into one file-level review for that agent.
-    Keep it simple: just concatenate with separators.
+    Concatenate with separators.
     """
     joined = "\n\n---\n\n".join(chunk_reviews).strip()
     return textwrap.dedent(f"""
@@ -181,6 +263,12 @@ def merge_chunk_reviews(agent_name: str, filepath: str, chunk_reviews: List[str]
 
 def node_collect_files(state: ReviewState) -> ReviewState:
     files = collect_files(state["repo_path"])
+    print(f"[collect_files] collected {len(files)} files")
+    if len(files) == 0:
+        raise RuntimeError(
+            "No files collected. MCP search_code likely failed, token lacks access, "
+            "or search_code output parsing is wrong."
+        )
     return {
         **state,
         "files": files,
