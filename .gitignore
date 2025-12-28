@@ -20,3 +20,7 @@ Test_Project/
 
 # Generated file
 report.md
+
+# Environment vars
+.env
+

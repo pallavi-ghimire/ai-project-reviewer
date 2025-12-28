@@ -1,7 +1,7 @@
 import argparse
-import os
+import json
 import textwrap
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional, TypedDict, Tuple, Any
 
 import requests
 from pathlib import Path
@@ -9,6 +9,22 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from langgraph.graph import StateGraph, END
+
+from mcp_client.github_client import GitHubMcpClient
+from mcp_server.github_server import github_mcp_server_params
+
+_mcp_client = None
+
+
+def get_mcp_client():
+    global _mcp_client
+    if _mcp_client is not None:
+        return _mcp_client
+
+    params = github_mcp_server_params()
+    _mcp_client = GitHubMcpClient(params)
+    return _mcp_client
+
 
 ##################
 # SETUP VARIABLES
@@ -68,6 +84,7 @@ Produce:
 #############################
 class ReviewState(TypedDict):
     repo_path: str
+    ref: str
     files: List[str]
     current_file: Optional[str]
     per_file_results: Dict[str, Dict[str, str]]
@@ -77,46 +94,186 @@ class ReviewState(TypedDict):
 ################
 # COLLECT FILES
 ################
+# CODE_EXTENSIONS = {
+#     ".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".cs", ".cpp", ".c",
+#     ".rs", ".kt", ".swift", ".sql", ".html", ".css", ".md"
+# }
+# Temporarily removed other extensions due to GitHub API limit
 CODE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".cs", ".cpp", ".c",
-    ".rs", ".kt", ".swift", ".sql", ".html", ".css", ".md"
+    ".html", ".py", ".md"
 }
 
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build", ".idea", ".pytest_cache"}
 
 
-def collect_files(repo_path: str) -> List[str]:
-    repo = Path(repo_path)
-    if not repo.exists():
-        raise FileNotFoundError(f"Repo path not found: {repo_path}")
-    if not repo.is_dir():
-        raise ValueError(f"Repo path is not a directory: {repo_path}")
+def _extract_json_from_mcp_content(resp: Any) -> Any:
+    """
+    Extract JSON payload from an MCP response.
+    The GitHub MCP server often returns directory listings as JSON content blocks.
+    """
+    content = getattr(resp, "content", None)
+    if content is None and isinstance(resp, dict):
+        content = resp.get("content")
 
-    found: List[str] = []
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for name in files:
-            p = Path(root) / name
-            if p.suffix.lower() in CODE_EXTENSIONS:
-                if p.stat().st_size > 300_000:
+    if not isinstance(content, list):
+        raise RuntimeError(f"Unexpected MCP response shape (no content list): {resp}")
+
+    for item in content:
+        if getattr(item, "type", None) == "json":
+            return getattr(item, "json", None)
+        if isinstance(item, dict) and item.get("type") == "json":
+            return item.get("json")
+
+    for item in content:
+        if getattr(item, "type", None) == "text":
+            t = getattr(item, "text", None)
+            if isinstance(t, str):
+                try:
+                    return json.loads(t)
+                except Exception:
+                    pass
+        if isinstance(item, dict) and item.get("type") == "text":
+            t = item.get("text")
+            if isinstance(t, str):
+                try:
+                    return json.loads(t)
+                except Exception:
+                    pass
+
+    raise RuntimeError(f"Could not extract JSON from MCP response: {resp}")
+
+
+def list_repo_paths_recursive(owner: str, repo: str, ref: str, start_path: str = "/") -> List[str]:
+    """
+    Recursively walk the repository tree using get_file_contents on directories.
+    Returns a flat list of file paths relative to repo root.
+    """
+    mcp = get_mcp_client()
+    to_visit = [start_path]
+    files: List[str] = []
+
+    while to_visit:
+        cur = to_visit.pop()
+        resp = mcp.call_tool(
+            "get_file_contents",
+            {"owner": owner, "repo": repo, "path": cur, "ref": ref},
+        )
+        data = _extract_json_from_mcp_content(resp)
+
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
                     continue
-                found.append(str(p))
-    found.sort()
-    return found
+                typ = item.get("type")
+                p = item.get("path") or item.get("name")
+                if not isinstance(p, str):
+                    continue
+                if item.get("path"):
+                    rel_path = item["path"].lstrip("/")
+                else:
+                    base = cur.strip("/")
+                    rel_path = f"{base}/{p}".strip("/") if base else p.strip("/")
+
+                if _skip(rel_path):
+                    continue
+
+                if typ == "dir":
+                    to_visit.append("/" + rel_path)
+                elif typ == "file":
+                    files.append(rel_path)
+
+            continue
+    return sorted(set(files))
+
+
+def collect_files(repo_path: str, ref: str) -> List[str]:
+    if "/" not in repo_path:
+        raise FileNotFoundError(f"Repo path not found (and not owner/repo): {repo_path}")
+
+    owner, repo_name = repo_path.split("/", 1)
+
+    all_files = list_repo_paths_recursive(owner, repo_name, ref, start_path="/")
+
+    found_paths = [
+        p for p in all_files
+        if Path(p).suffix.lower() in CODE_EXTENSIONS
+    ]
+
+    found_paths = sorted(set(found_paths))
+    return [f"ghmcp://{owner}/{repo_name}@{ref}/{p}" for p in found_paths]
 
 
 ###########################
 # READ FILES FROM THE REPO
 ###########################
+
+
+def _get(obj: Any, key: str, default=None):
+    """Get attribute or dict key."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _extract_text_from_get_file_contents(resp: Any) -> str:
+    content = _get(resp, "content")
+    if content is None and isinstance(resp, dict):
+        content = resp.get("content")
+
+    if not isinstance(content, list):
+        raise RuntimeError(f"Unexpected get_file_contents response shape: {resp!r}")
+
+    candidates: List[str] = []
+
+    for item in content:
+        resource = _get(item, "resource")
+        resource_text = _get(resource, "text")
+        if isinstance(resource_text, str) and resource_text.strip():
+            candidates.append(resource_text)
+            continue
+
+        if _get(item, "type") == "json":
+            j = _get(item, "json")
+            j_content = _get(j, "content")
+            if isinstance(j_content, str) and j_content.strip():
+                candidates.append(j_content)
+                continue
+
+        if _get(item, "type") == "text":
+            t = _get(item, "text")
+            if isinstance(t, str) and t.strip():
+                candidates.append(t)
+                continue
+
+    if not candidates:
+        raise RuntimeError(f"Could not extract text from get_file_contents response: {resp!r}")
+
+    def score(s: str) -> int:
+        base = len(s)
+        if "\n" in s:
+            base += 500
+        if "SHA:" in s or "successfully downloaded" in s.lower():
+            base -= 2000
+        return base
+
+    return max(candidates, key=score)
+
+
 def read_text(path: str) -> str:
+    if path.startswith("ghmcp://"):
+        rest = path[len("ghmcp://"):]  # owner/repo@ref/path/to/file
+        owner, rest = rest.split("/", 1)  # owner | repo@ref/path/to/file
+        repo_at_ref, file_path = rest.split("/", 1)  # repo@ref | path/to/file
+        repo_name, ref = repo_at_ref.split("@", 1)  # repo | ref
+
+        mcp = get_mcp_client()
+        resp = mcp.call_tool(
+            "get_file_contents",
+            {"owner": owner, "repo": repo_name, "path": file_path, "ref": ref},
+        )
+        return _extract_text_from_get_file_contents(resp)
+
     return Path(path).read_text(encoding="utf-8", errors="replace")
-
-
-def read_file(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    return p.read_text(encoding="utf-8", errors="replace")
 
 
 ####################################################################################################
@@ -169,7 +326,7 @@ def build_prompt(system_prompt: str, filepath: str, chunk: Chunk) -> str:
 def merge_chunk_reviews(agent_name: str, filepath: str, chunk_reviews: List[str]) -> str:
     """
     Merge chunk-level reviews into one file-level review for that agent.
-    Keep it simple: just concatenate with separators.
+    Concatenate with separators.
     """
     joined = "\n\n---\n\n".join(chunk_reviews).strip()
     return textwrap.dedent(f"""
@@ -180,7 +337,13 @@ def merge_chunk_reviews(agent_name: str, filepath: str, chunk_reviews: List[str]
 
 
 def node_collect_files(state: ReviewState) -> ReviewState:
-    files = collect_files(state["repo_path"])
+    files = collect_files(state["repo_path"], state["ref"]) or []
+    print(f"[collect_files] collected {len(files)} files")
+    if len(files) == 0:
+        raise RuntimeError(
+            "No files collected. MCP search_code likely failed, token lacks access, "
+            "or search_code output parsing is wrong."
+        )
     return {
         **state,
         "files": files,
@@ -255,7 +418,6 @@ def node_review_all_files(state: ReviewState) -> ReviewState:
 
 
 def node_aggregate_repo_report(state: ReviewState) -> ReviewState:
-    # Prepare a compact input to the final aggregator (use lead summaries, not all raw text).
     per_file_leads: List[str] = []
     for filepath, d in state["per_file_results"].items():
         per_file_leads.append(f"FILE: {filepath}\n{d.get('lead', '').strip()}")
@@ -310,6 +472,63 @@ def call_ollama(prompt: str, model: str = MODEL_NAME) -> str:
     return data.get("response", "")
 
 
+def parse_gh_uri(uri: str) -> Tuple[str, str, str, str]:
+    # gh://owner/repo@ref/path
+    if not uri.startswith("gh://"):
+        raise ValueError(f"Not a gh:// uri: {uri}")
+    rest = uri[len("gh://"):]
+    owner, rest = rest.split("/", 1)
+    repo_at_ref, *maybe_path = rest.split("/", 1)
+    repo, ref = repo_at_ref.split("@", 1)
+    path = maybe_path[0] if maybe_path else ""
+    return owner, repo, ref, path
+
+
+def _extract_paths_from_search_code(resp: Any) -> List[str]:
+    """
+    Extract file paths from the MCP result of search_code.
+    The exact JSON shape can vary; we handle the typical content->json structure.
+    """
+    paths: List[str] = []
+
+    content = getattr(resp, "content", None)
+    if content is None and isinstance(resp, dict):
+        content = resp.get("content")
+
+    if not isinstance(content, list):
+        return paths
+
+    for item in content:
+        if getattr(item, "type", None) == "json":
+            data = getattr(item, "json", None)
+        elif isinstance(item, dict) and item.get("type") == "json":
+            data = item.get("json")
+        else:
+            continue
+
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("results") or data.get("matches")
+            if isinstance(items, list):
+                for it in items:
+                    if isinstance(it, dict):
+                        p = it.get("path")
+                        if isinstance(p, str):
+                            paths.append(p)
+        elif isinstance(data, list):
+            for it in data:
+                if isinstance(it, dict):
+                    p = it.get("path")
+                    if isinstance(p, str):
+                        paths.append(p)
+
+    return paths
+
+
+def _skip(path: str) -> bool:
+    parts = path.split("/")
+    return any(p in SKIP_DIRS for p in parts)
+
+
 ################
 # MAIN FUNCTION
 ################
@@ -317,6 +536,7 @@ def call_ollama(prompt: str, model: str = MODEL_NAME) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Local AI code reviewer using Ollama.")
     parser.add_argument("--path", required=True, help="Path to the repo to review.")
+    parser.add_argument("--ref", default="main", help="Git ref (branch/tag/SHA) to review for GitHub repos.")
     parser.add_argument("--out", default="report.md", help="Output .md report path.")
     args = parser.parse_args()
 
@@ -324,6 +544,7 @@ def main():
 
     init_state: ReviewState = {
         "repo_path": args.path,
+        "ref": args.ref,
         "files": [],
         "current_file": None,
         "per_file_results": {},
