@@ -109,4 +109,4 @@ python main.py \
   --path username/project_name \
   --out report.md 
 ```
-Note: --out is optional.
+Note: --out is optional; by default the report is generated in report.md.
