@@ -1,186 +1,62 @@
 import argparse
-import os
 import textwrap
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional, TypedDict, Any
 
-import requests
 from pathlib import Path
-
-from dataclasses import dataclass
 
 from langgraph.graph import StateGraph, END
 
-##################
-# SETUP VARIABLES
-##################
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "gemma3:4b"
+from configs.aggregator_prompt import AGGREGATOR_PROMPT
+from configs.docs_prompt import DOCS_PROMPT
+from configs.lead_prompt import LEAD_PROMPT
+from configs.performance_prompt import PERFORMANCE_PROMPT
+from configs.security_prompt import SECURITY_PROMPT
+from helpers.node_collect_files import collect_files
+from helpers.node_review_all_files import extract_text_from_get_file_contents, chunk_code_by_lines, build_prompt, \
+    merge_chunk_reviews
+from mcp_client.github_client import GitHubMcpClient
+from mcp_server.github_server import github_mcp_server_params
+from ollama import call_ollama
+
+#######
+# INIT
+#######
+_mcp_client = None
 
 
-SECURITY_PROMPT = """You are a strict security-focused code reviewer.
-Find vulnerabilities (injection, auth, secrets, unsafe deserialization, SSRF, etc.).
-Return:
-- High risk issues
-- Medium risk issues
-- Low risk issues
-- Concrete fixes (short snippets ok)
-Use line numbers or line ranges when possible.
-"""
+def get_mcp_client():
+    global _mcp_client
+    if _mcp_client is not None:
+        return _mcp_client
 
-PERFORMANCE_PROMPT = """You are a strict performance-focused code reviewer.
-Find inefficient logic, unnecessary I/O, repeated work, heavy loops, bad complexity, memory issues.
-Return:
-- Major bottlenecks
-- Minor bottlenecks
-- Concrete fixes (short snippets ok)
-Use line numbers or line ranges when possible.
-"""
+    params = github_mcp_server_params()
+    _mcp_client = GitHubMcpClient(params)
+    return _mcp_client
 
-DOCS_PROMPT = """You are a strict readability/docs/maintainability reviewer.
-Find confusing naming, unclear structure, missing docstrings, poor error handling, inconsistent style.
-Return:
-- Maintainability risks
-- Readability issues
-- Suggested refactors
-Use line numbers or line ranges when possible.
-"""
-
-LEAD_PROMPT = """You are a lead software engineer.
-You will receive three reviews: security, performance, docs.
-Your job:
-1) Combine them into one clear per-file review.
-2) List the top 3 issues to fix first.
-3) Add a quick "overall verdict" (OK / Needs Work / Dangerous).
-Be specific and concise.
-"""
-
-AGGREGATOR_PROMPT = """You are a lead engineer summarizing a repo review.
-You will receive per-file reviews.
-Produce:
-1) Executive summary (5-10 bullet points)
-2) Top 10 issues across the repo (ranked by severity/impact)
-3) Hotspot files (files with most severe issues)
-4) Recommended next steps (action plan)
-"""
 
 #############################
 # LANGGRAPH STATES AND NODES
 #############################
 class ReviewState(TypedDict):
     repo_path: str
+    ref: str
     files: List[str]
     current_file: Optional[str]
     per_file_results: Dict[str, Dict[str, str]]
     final_report_md: str
 
 
-################
-# COLLECT FILES
-################
-CODE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".cs", ".cpp", ".c",
-    ".rs", ".kt", ".swift", ".sql", ".html", ".css", ".md"
-}
-
-SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build", ".idea", ".pytest_cache"}
-
-
-def collect_files(repo_path: str) -> List[str]:
-    repo = Path(repo_path)
-    if not repo.exists():
-        raise FileNotFoundError(f"Repo path not found: {repo_path}")
-    if not repo.is_dir():
-        raise ValueError(f"Repo path is not a directory: {repo_path}")
-
-    found: List[str] = []
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for name in files:
-            p = Path(root) / name
-            if p.suffix.lower() in CODE_EXTENSIONS:
-                if p.stat().st_size > 300_000:
-                    continue
-                found.append(str(p))
-    found.sort()
-    return found
-
-
-###########################
-# READ FILES FROM THE REPO
-###########################
-def read_text(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8", errors="replace")
-
-
-def read_file(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    return p.read_text(encoding="utf-8", errors="replace")
-
-
-####################################################################################################
-# CHUNKING FILES. EACH CHUNK HAS 180 LINES. THERE IS AN OVERLAP OF 30 LINES FOR MAINTAINING CONTEXT
-####################################################################################################
-@dataclass
-class Chunk:
-    start_line: int
-    end_line: int
-    text: str
-
-
-def chunk_code_by_lines(code: str, max_lines: int = 180, overlap: int = 30) -> List[Chunk]:
-    lines = code.splitlines()
-    chunks: List[Chunk] = []
-
-    i = 0
-    n = len(lines)
-    while i < n:
-        start = i
-        end = min(i + max_lines, n)
-        chunk_lines = lines[start:end]
-        chunk_text = "\n".join(chunk_lines)
-        chunks.append(Chunk(start_line=start + 1, end_line=end, text=chunk_text))
-
-        if end == n:
-            break
-        i = end - overlap
-        if i < 0:
-            i = 0
-
-    return chunks
-
-
-def build_prompt(system_prompt: str, filepath: str, chunk: Chunk) -> str:
-    return textwrap.dedent(f"""
-    {system_prompt}
-
-    File: {filepath}
-    Chunk lines: {chunk.start_line}-{chunk.end_line}
-
-    ```text
-    {chunk.text}
-    ```
-
-    Review this chunk. Be specific and strict.
-    """)
-
-
-def merge_chunk_reviews(agent_name: str, filepath: str, chunk_reviews: List[str]) -> str:
-    """
-    Merge chunk-level reviews into one file-level review for that agent.
-    Keep it simple: just concatenate with separators.
-    """
-    joined = "\n\n---\n\n".join(chunk_reviews).strip()
-    return textwrap.dedent(f"""
-    [{agent_name} REVIEW] {filepath}
-
-    {joined}
-    """).strip()
-
-
+#################################
+# COLLECT REPO FILES
+#################################
 def node_collect_files(state: ReviewState) -> ReviewState:
-    files = collect_files(state["repo_path"])
+    files = collect_files(state["repo_path"], state["ref"]) or []
+    print(f"[collect_files] collected {len(files)} files")
+    if len(files) == 0:
+        raise RuntimeError(
+            "No files collected. MCP search_code likely failed, token lacks access, "
+            "or search_code output parsing is wrong."
+        )
     return {
         **state,
         "files": files,
@@ -203,6 +79,23 @@ def review_file_with_agent(filepath: str, system_prompt: str, agent_name: str) -
         chunk_reviews.append(call_ollama(prompt))
 
     return merge_chunk_reviews(agent_name, filepath, chunk_reviews)
+
+
+def read_text(path: str) -> str:
+    if path.startswith("ghmcp://"):
+        rest = path[len("ghmcp://"):]  # owner/repo@ref/path/to/file
+        owner, rest = rest.split("/", 1)  # owner | repo@ref/path/to/file
+        repo_at_ref, file_path = rest.split("/", 1)  # repo@ref | path/to/file
+        repo_name, ref = repo_at_ref.split("@", 1)  # repo | ref
+
+        mcp = get_mcp_client()
+        resp = mcp.call_tool(
+            "get_file_contents",
+            {"owner": owner, "repo": repo_name, "path": file_path, "ref": ref},
+        )
+        return extract_text_from_get_file_contents(resp)
+
+    return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
 def node_review_all_files(state: ReviewState) -> ReviewState:
@@ -248,17 +141,18 @@ def node_review_all_files(state: ReviewState) -> ReviewState:
             "lead": lead,
         }
 
-        # basic progress print (optional)
         print(f"Reviewed: {filepath}")
 
     return {**state, "per_file_results": results}
 
 
+################
+# CREATE REPORT
+################
 def node_aggregate_repo_report(state: ReviewState) -> ReviewState:
-    # Prepare a compact input to the final aggregator (use lead summaries, not all raw text).
     per_file_leads: List[str] = []
     for filepath, d in state["per_file_results"].items():
-        per_file_leads.append(f"FILE: {filepath}\n{d.get('lead','').strip()}")
+        per_file_leads.append(f"FILE: {filepath}\n{d.get('lead', '').strip()}")
 
     combined = "\n\n====================\n\n".join(per_file_leads)
 
@@ -292,24 +186,6 @@ def build_graph():
     return g.compile()
 
 
-##############
-# CALL OLLAMA
-##############
-def call_ollama(prompt: str, model: str = MODEL_NAME) -> str:
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-        },
-        timeout=240,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data.get("response", "")
-
-
 ################
 # MAIN FUNCTION
 ################
@@ -317,6 +193,7 @@ def call_ollama(prompt: str, model: str = MODEL_NAME) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Local AI code reviewer using Ollama.")
     parser.add_argument("--path", required=True, help="Path to the repo to review.")
+    parser.add_argument("--ref", default="main", help="Git ref (branch/tag/SHA) to review for GitHub repos.")
     parser.add_argument("--out", default="report.md", help="Output .md report path.")
     args = parser.parse_args()
 
@@ -324,6 +201,7 @@ def main():
 
     init_state: ReviewState = {
         "repo_path": args.path,
+        "ref": args.ref,
         "files": [],
         "current_file": None,
         "per_file_results": {},
@@ -335,7 +213,6 @@ def main():
     out_path = Path(args.out)
     out_path.write_text(final_state["final_report_md"], encoding="utf-8")
     print(f"\nWrote report: {out_path.resolve()}")
-
 
 
 if __name__ == "__main__":

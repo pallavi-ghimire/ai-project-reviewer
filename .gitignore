@@ -1,5 +1,7 @@
 # Python virtual environments
 .venv/
+.venv/
+venv314/
 venv/
 env/
 Lib/
@@ -15,3 +17,10 @@ __pycache__/
 
 # Test repos
 Test_Project/
+
+# Generated file
+report.md
+
+# Environment vars
+.env
+
