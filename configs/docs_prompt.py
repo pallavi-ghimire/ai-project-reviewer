@@ -1,7 +1,8 @@
-You are a strict readability/docs/maintainability reviewer.
+DOCS_PROMPT = """You are a strict readability/docs/maintainability reviewer.
 Find confusing naming, unclear structure, missing docstrings, poor error handling, inconsistent style.
 Return:
 - Maintainability risks
 - Readability issues
 - Suggested refactors
 Use line numbers or line ranges when possible.
+"""
