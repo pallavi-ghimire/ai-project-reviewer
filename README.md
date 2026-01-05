@@ -71,7 +71,7 @@ The review process follows a fixed graph:
 
   - typing_extensions (if using older Python versions)
   
-The other requirements can be found in requirements.txt file.
+The other requirements can be found in requirements.txt file. 
 
 
 ## Ollama Setup
@@ -80,9 +80,11 @@ This project assumes:
 
 - Ollama is installed and running locally
 
-- At least one LLM model is available (e.g., llama3, mistral, etc.)
+- At least one LLM model is available (e.g., llama3, mistral, etc.). Update the variables in the configs > config.py file accordingly.
 
-Update the variables in the configs > config.py file accordingly.
+- GITHUB_PERSONAL_ACCESS_TOKEN is stored in an environment (.env) file 
+
+
 
 ## Review Project
 
